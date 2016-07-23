@@ -3,6 +3,8 @@ extern crate glob;
 extern crate procinfo;
 extern crate time;
 extern crate libc;
+extern crate nix;
+extern crate sysconf;
 
 use std::fs::File;
 use std::io::Read;
@@ -11,6 +13,7 @@ use std::collections::HashMap;
 use time::{Duration, PreciseTime};
 use glob::glob;
 use libc::{clock_t,pid_t,uid_t};
+use nix::sys::signal;
 
 fn get_temp_from<P: AsRef<Path>>(file_path: P) -> Result<f32, String> {
     let mut file = try!(File::open(file_path).map_err(|e| e.to_string()));
@@ -83,6 +86,15 @@ fn update_times(from: &mut CPUTimes, to: &mut CPUTimes) -> Result<(), String> {
     Ok(())
 }
 
+fn killall(pids : &Vec<(f32, pid_t, String)>, signal : signal::SigNum) {
+    for &(_, pid, ref name) in pids {
+        if let Err(e) = signal::kill(pid, signal) {
+            println!("Error killing {} ({}) with {} : {}", name, pid, signal, e);
+        }
+    }
+}
+
+
 static mut self_pid : pid_t = 0;
 static mut self_uid : uid_t = 0;
 static mut CLK_TCK : u32 = 100;
@@ -94,9 +106,9 @@ const TOLERANCE : f32 = 0.8;
 fn main() {
     
     unsafe {
-        self_pid = libc::getpid();
-        self_uid = libc::getuid();
-        CLK_TCK = libc::sysconf(libc::_SC_CLK_TCK) as u32;
+        self_pid = nix::unistd::getpid();
+        self_uid = nix::unistd::getuid();
+        CLK_TCK = sysconf::sysconf(sysconf::SysconfVariable::ScClkTck).expect("Unable to get sysconf(CLK_TK)") as u32;
         println!("{} {} {}", self_pid, self_uid, CLK_TCK);
     }
 
@@ -157,21 +169,9 @@ fn main() {
 
         // ralentir les pids sélectionnés
         if time_consumers.len() > 0 {
-            //let a = PreciseTime::now();
-            for &(_, pid, _) in &time_consumers {
-                let ret = unsafe{ libc::kill(pid, libc::SIGSTOP) };
-                if ret != 0 {
-                    println!("kill {} STOP returned {}", pid, ret);
-                }
-            }
+            killall(&time_consumers, signal::SIGSTOP);
             std::thread::sleep(std::time::Duration::new(0, ((tick.num_nanoseconds().unwrap() as f32)*(1.-MAX_CPU/total_cpu)) as u32));
-            for &(_, pid, _) in &time_consumers {
-                let ret = unsafe{ libc::kill(pid, libc::SIGCONT) };
-                if ret != 0 {
-                    println!("kill {} CONT returned {}", pid, ret);
-             }
-            }
-            //println!("{}", a.to(PreciseTime::now()))
+            killall(&time_consumers, signal::SIGCONT);
         }
     }
 }
