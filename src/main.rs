@@ -143,7 +143,6 @@ fn main() {
 
     loop {
         if let Ok(duration) = (tick - last_loop.to(PreciseTime::now())).to_std() {
-            //println!("{:?}", duration);
             std::thread::sleep(duration);
         }
         last_loop = PreciseTime::now();
@@ -176,14 +175,13 @@ fn main() {
                 time_consumers.clear();
             }
 
-            println!("blah");
             for &(ref time, ref pid, ref name) in &time_consumers {
                 println!("{}\t{}\t{}", pid, time*100., name);
-                //println!("{:?}", procinfo::pid::status(pid).unwrap())
             }
             
             // at this point, all the processes are SIGCONT'ed :
             if unsafe{ should_exit } {
+                println!("Exit cleanly.");
                 break;
             }
         }
@@ -197,6 +195,7 @@ fn main() {
 
         // at this point, all the processes are SIGCONT'ed :
         if unsafe{ should_exit } {
+            println!("Exit cleanly.");
             break;
         }
 
