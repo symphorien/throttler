@@ -94,21 +94,37 @@ fn killall(pids : &Vec<(f32, pid_t, String)>, signal : signal::SigNum) {
     }
 }
 
+#[allow(unused_variables)]
+extern "C" fn set_should_exit(signal : signal::SigNum) {
+    unsafe { should_exit = true; }
+}
+
 
 static mut self_pid : pid_t = 0;
 static mut self_uid : uid_t = 0;
 static mut CLK_TCK : u32 = 100;
+static mut should_exit : bool = false;
 
 const MIN_CPU : f32 = 0.01;
 const MAX_CPU : f32 = 0.05;
 const TOLERANCE : f32 = 0.8;
 
 fn main() {
+
+    let sig_action = signal::SigAction::new(signal::SigHandler::Handler(set_should_exit), signal::SaFlags::empty(), signal::SigSet::all());
     
     unsafe {
         self_pid = nix::unistd::getpid();
         self_uid = nix::unistd::getuid();
         CLK_TCK = sysconf::sysconf(sysconf::SysconfVariable::ScClkTck).expect("Unable to get sysconf(CLK_TK)") as u32;
+        for &signal in [
+            signal::SIGHUP,
+            signal::SIGINT,
+            signal::SIGQUIT,
+            signal::SIGTERM,
+            ].iter() {
+                signal::sigaction(signal, &sig_action).expect("Could not set signal handler");
+        }
         println!("{} {} {}", self_pid, self_uid, CLK_TCK);
     }
 
@@ -165,6 +181,11 @@ fn main() {
                 println!("{}\t{}\t{}", pid, time*100., name);
                 //println!("{:?}", procinfo::pid::status(pid).unwrap())
             }
+            
+            // at this point, all the processes are SIGCONT'ed :
+            if unsafe{ should_exit } {
+                break;
+            }
         }
 
         // ralentir les pids sélectionnés
@@ -173,5 +194,11 @@ fn main() {
             std::thread::sleep(std::time::Duration::new(0, ((tick.num_nanoseconds().unwrap() as f32)*(1.-MAX_CPU/total_cpu)) as u32));
             killall(&time_consumers, signal::SIGCONT);
         }
+
+        // at this point, all the processes are SIGCONT'ed :
+        if unsafe{ should_exit } {
+            break;
+        }
+
     }
 }
