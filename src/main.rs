@@ -106,8 +106,9 @@ static mut CLK_TCK : u32 = 100;
 static mut should_exit : bool = false;
 
 const MIN_CPU : f32 = 0.01;
-const MAX_CPU : f32 = 0.05;
 const TOLERANCE : f32 = 0.8;
+const MIN_TEMP : f32 = 50.;
+const MAX_TEMP : f32 = 65.;
 
 fn main() {
 
@@ -131,6 +132,7 @@ fn main() {
     let mut procinfo = HashMap::new();
     let mut reserve = HashMap::new();
     let mut total_cpu : f32 = 0.;
+    let mut max_cpu : f32 = 1.;
     let mut time_consumers : Vec<(f32, pid_t, String)> = vec![];
     let mut last_times_refresh = PreciseTime::now();
     let times_refresh_interval = Duration::seconds(2);
@@ -147,7 +149,7 @@ fn main() {
         }
         last_loop = PreciseTime::now();
 
-        // une fois par seconde, calculer les pids à relentir
+        // une fois par seconde, calculer les pids à relentir et la bride
         if last_times_refresh.to(PreciseTime::now()) > times_refresh_interval {
             last_times_refresh = PreciseTime::now();
             std::mem::swap(&mut reserve, &mut procinfo);
@@ -160,7 +162,7 @@ fn main() {
 
             total_cpu = time_consumers.iter().fold(0., |acc, &(t, _, _)| acc+t);
 
-            if total_cpu * TOLERANCE > MAX_CPU {
+            if total_cpu * TOLERANCE > max_cpu {
                 let mut partial_sum = 0.;
                 let mut i:usize = 0;
                 for &(t, _, _) in &time_consumers {
@@ -178,6 +180,12 @@ fn main() {
             for &(ref time, ref pid, ref name) in &time_consumers {
                 println!("{}\t{}\t{}", pid, time*100., name);
             }
+
+            if let Ok(temp) = get_temp() {
+                println!("{} °C", temp);
+                max_cpu = MIN_CPU + (1. - MIN_CPU)*1f32.min(0f32.max((MAX_TEMP - temp)/(MAX_TEMP - MIN_TEMP)));
+            }
+            println!("{}", max_cpu);
             
             // at this point, all the processes are SIGCONT'ed :
             if unsafe{ should_exit } {
@@ -189,7 +197,7 @@ fn main() {
         // ralentir les pids sélectionnés
         if time_consumers.len() > 0 {
             killall(&time_consumers, signal::SIGSTOP);
-            std::thread::sleep(std::time::Duration::new(0, ((tick.num_nanoseconds().unwrap() as f32)*(1.-MAX_CPU/total_cpu)) as u32));
+            std::thread::sleep(std::time::Duration::new(0, ((tick.num_nanoseconds().unwrap() as f32)*(1.-max_cpu/total_cpu)) as u32));
             killall(&time_consumers, signal::SIGCONT);
         }
 
