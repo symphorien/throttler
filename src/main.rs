@@ -17,6 +17,7 @@ use time::{Duration, PreciseTime};
 use glob::glob;
 use libc::{clock_t,pid_t,uid_t};
 use nix::sys::signal;
+use std::sync::atomic::{AtomicBool, Ordering, ATOMIC_BOOL_INIT};
 
 fn get_temp_from<P: AsRef<Path>>(file_path: P) -> Result<f32, String> {
     let mut file = try!(File::open(file_path).map_err(|e| e.to_string()));
@@ -99,7 +100,7 @@ fn killall<'a, T: Iterator<Item=&'a pid_t> >(pids : T, signal : signal::SigNum) 
 
 #[allow(unused_variables)]
 extern "C" fn set_should_exit(signal : signal::SigNum) {
-    unsafe { should_exit = true; }
+    SHOULD_EXIT.store(true, Ordering::SeqCst);
 }
 
 
@@ -108,7 +109,7 @@ lazy_static!{
     static ref SELF_UID : uid_t = nix::unistd::getuid();
     static ref CLK_TCK : u32 = sysconf::sysconf(sysconf::SysconfVariable::ScClkTck).expect("Unable to get sysconf(CLK_TK)") as u32;
 }
-static mut should_exit : bool = false;
+static SHOULD_EXIT : AtomicBool = ATOMIC_BOOL_INIT;
 
 const MIN_CPU : f32 = 0.01;
 const TOLERANCE : f32 = 0.8;
@@ -185,7 +186,7 @@ fn main() {
             println!("Target {} % -> ralentissation\nenforced on {:?}", max_cpu, targets);
             
             // at this point, all the processes are SIGCONT'ed :
-            if unsafe{ should_exit } {
+            if SHOULD_EXIT.load(Ordering::SeqCst) {
                 println!("Exit cleanly.");
                 break;
             }
@@ -199,7 +200,7 @@ fn main() {
         }
 
         // at this point, all the processes are SIGCONT'ed :
-        if unsafe{ should_exit } {
+        if SHOULD_EXIT.load(Ordering::SeqCst) {
             println!("Exit cleanly.");
             break;
         }
