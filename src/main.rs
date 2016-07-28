@@ -11,7 +11,8 @@ extern crate lazy_static;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use std::collections::HashMap;
+use std::iter::FromIterator;
+use std::collections::{HashMap, HashSet};
 use time::{Duration, PreciseTime};
 use glob::glob;
 use libc::{clock_t,pid_t,uid_t};
@@ -88,10 +89,10 @@ fn update_times(from: &mut CPUTimes, to: &mut CPUTimes) -> Result<(), String> {
     Ok(())
 }
 
-fn killall(pids : &Vec<(f32, pid_t, String)>, signal : signal::SigNum) {
-    for &(_, pid, ref name) in pids {
+fn killall<'a, T: Iterator<Item=&'a pid_t> >(pids : T, signal : signal::SigNum) {
+    for &pid in pids {
         if let Err(e) = signal::kill(pid, signal) {
-            println!("Error killing {} ({}) with {} : {}", name, pid, signal, e);
+            println!("Error killing {} with {} : {}", pid, signal, e);
         }
     }
 }
@@ -134,6 +135,7 @@ fn main() {
     let mut total_cpu : f32 = 0.;
     let mut max_cpu : f32 = 1.;
     let mut time_consumers : Vec<(f32, pid_t, String)> = vec![];
+    let mut targets = HashSet::new();
     let mut last_times_refresh = PreciseTime::now();
     let times_refresh_interval = Duration::seconds(2);
     if let Err(e) = update_times(&mut reserve, &mut procinfo) {
@@ -156,36 +158,31 @@ fn main() {
             if let Err(e) = update_times(&mut reserve, &mut procinfo) {
                 println!("{}", e);
             }
-            time_consumers.clear();
-            time_consumers.extend(procinfo.iter().filter_map(|(&pid, time)| if time.share > MIN_CPU { Some((time.share, pid, time.name.to_owned())) } else { None }));
+            time_consumers.extend(procinfo.iter().filter_map(|(&pid, time)| if time.share > MIN_CPU*TOLERANCE { Some((time.share, pid, time.name.to_owned())) } else { None }));
             time_consumers.sort_by(|&(t, _, _), &(u, _, _)| u.partial_cmp(&t).unwrap());
 
             total_cpu = time_consumers.iter().fold(0., |acc, &(t, _, _)| acc+t);
+            println!("CPU : {} % : {:?}", total_cpu, time_consumers);
 
             if total_cpu * TOLERANCE > max_cpu {
                 let mut partial_sum = 0.;
-                let mut i:usize = 0;
-                for &(t, _, _) in &time_consumers {
+                for &(t, pid, _) in &time_consumers {
                     partial_sum += t;
-                    i+=1;
+                    targets.insert(pid);
                     if partial_sum >= total_cpu * TOLERANCE {
                         break;
                     }
                 }
-                time_consumers.truncate(i);
-            } else {
-                time_consumers.clear();
             }
+            
+            targets = &targets & &HashSet::from_iter(&mut time_consumers.drain(..).map(|(_, pid, _)| pid));
 
-            for &(ref time, ref pid, ref name) in &time_consumers {
-                println!("{}\t{}\t{}", pid, time*100., name);
-            }
 
             if let Ok(temp) = get_temp() {
                 println!("{} °C", temp);
                 max_cpu = MIN_CPU + (1. - MIN_CPU)*1f32.min(0f32.max((MAX_TEMP - temp)/(MAX_TEMP - MIN_TEMP)));
             }
-            println!("{}", max_cpu);
+            println!("Target {} % -> ralentissation\nenforced on {:?}", max_cpu, targets);
             
             // at this point, all the processes are SIGCONT'ed :
             if unsafe{ should_exit } {
@@ -195,10 +192,10 @@ fn main() {
         }
 
         // ralentir les pids sélectionnés
-        if time_consumers.len() > 0 {
-            killall(&time_consumers, signal::SIGSTOP);
-            std::thread::sleep(std::time::Duration::new(0, ((tick.num_nanoseconds().unwrap() as f32)*(1.-max_cpu/total_cpu)) as u32));
-            killall(&time_consumers, signal::SIGCONT);
+        if targets.len() > 0 && total_cpu * TOLERANCE > max_cpu {
+            killall(targets.iter(), signal::SIGSTOP);
+            std::thread::sleep(std::time::Duration::new(0, ((tick.num_nanoseconds().unwrap() as f32)*(1.-max_cpu)) as u32));
+            killall(targets.iter(), signal::SIGCONT);
         }
 
         // at this point, all the processes are SIGCONT'ed :
