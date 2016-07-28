@@ -5,9 +5,10 @@ authors = ["Symphorien Gibol <symphorien@xlumurb.eu>"]
 
 [dependencies]
 procure = "*"
-procinfo = "0.2.2"
+procinfo = "*"
 glob = "*"
 time = "*"
 libc = "*"
 nix = "*"
 sysconf = "*"
+lazy_static = "*"

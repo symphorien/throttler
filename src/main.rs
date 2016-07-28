@@ -5,6 +5,8 @@ extern crate time;
 extern crate libc;
 extern crate nix;
 extern crate sysconf;
+#[macro_use]
+extern crate lazy_static;
 
 use std::fs::File;
 use std::io::Read;
@@ -34,7 +36,7 @@ fn get_temp() -> Result<f32, String> {
 }
 
 fn filter_process(p : &procinfo::pid::Stat) -> bool {
-    if p.pid == unsafe{self_pid} {
+    if p.pid == *SELF_PID {
         return false;
     }
     if p.priority < 20 { // nice <0 or realtime
@@ -43,11 +45,11 @@ fn filter_process(p : &procinfo::pid::Stat) -> bool {
     if p.pid == 1 {
         return false;
     }
-    if unsafe{self_uid} != 0 {
+    if *SELF_UID != 0 {
         match procinfo::pid::status(p.pid) {
             Ok(infos)=> {
                 //println!("oui{}", p.command);
-                if infos.uid_saved != unsafe{self_uid} && infos.uid_real != unsafe{self_uid} {
+                if infos.uid_saved != *SELF_UID && infos.uid_real != *SELF_UID {
                     return false;
                 }
             },
@@ -77,7 +79,7 @@ fn update_times(from: &mut CPUTimes, to: &mut CPUTimes) -> Result<(), String> {
             let newtime = infos.utime + infos.stime;
             let newtimestamp = PreciseTime::now();
             to.insert(pid, CPUTime {time: newtime, timestamp: newtimestamp, name: infos.command, share: match from.get(&pid) {
-                Some(time) => (newtime - time.time) as f32 /time.timestamp.to(newtimestamp).num_microseconds().unwrap() as f32 * 1000000. / (unsafe{CLK_TCK} as f32),
+                Some(time) => (newtime - time.time) as f32 /time.timestamp.to(newtimestamp).num_microseconds().unwrap() as f32 * 1000000. / (*CLK_TCK as f32),
                 None => 0.
             }});
         }
@@ -100,9 +102,11 @@ extern "C" fn set_should_exit(signal : signal::SigNum) {
 }
 
 
-static mut self_pid : pid_t = 0;
-static mut self_uid : uid_t = 0;
-static mut CLK_TCK : u32 = 100;
+lazy_static!{
+    static ref SELF_PID : pid_t = nix::unistd::getpid();
+    static ref SELF_UID : uid_t = nix::unistd::getuid();
+    static ref CLK_TCK : u32 = sysconf::sysconf(sysconf::SysconfVariable::ScClkTck).expect("Unable to get sysconf(CLK_TK)") as u32;
+}
 static mut should_exit : bool = false;
 
 const MIN_CPU : f32 = 0.01;
@@ -115,9 +119,6 @@ fn main() {
     let sig_action = signal::SigAction::new(signal::SigHandler::Handler(set_should_exit), signal::SaFlags::empty(), signal::SigSet::all());
     
     unsafe {
-        self_pid = nix::unistd::getpid();
-        self_uid = nix::unistd::getuid();
-        CLK_TCK = sysconf::sysconf(sysconf::SysconfVariable::ScClkTck).expect("Unable to get sysconf(CLK_TK)") as u32;
         for &signal in [
             signal::SIGHUP,
             signal::SIGINT,
@@ -126,7 +127,6 @@ fn main() {
             ].iter() {
                 signal::sigaction(signal, &sig_action).expect("Could not set signal handler");
         }
-        println!("{} {} {}", self_pid, self_uid, CLK_TCK);
     }
 
     let mut procinfo = HashMap::new();
