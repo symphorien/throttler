@@ -49,6 +49,9 @@ fn filter_process(p : &procinfo::pid::Stat) -> bool {
     if p.pid == 1 {
         return false;
     }
+    if OPTS.exclude_tty && p.tty_nr != 0 && p.pid == p.tty_pgrp {
+        return false;
+    }
     if *SELF_UID != 0 {
         match procinfo::pid::status(p.pid) {
             Ok(infos)=> {
@@ -109,6 +112,7 @@ struct Options {
     verbose : bool,
     tick: u16,
     interval: u8,
+    exclude_tty: bool,
 }
 
 fn parse_args() -> Options {
@@ -120,6 +124,7 @@ fn parse_args() -> Options {
         verbose : false,
         tick : 100,
         interval : 10,
+        exclude_tty: false,
     };
     {
         let mut ap = ArgumentParser::new();
@@ -145,6 +150,9 @@ fn parse_args() -> Options {
         ap.refer(&mut opt.interval)
             .add_option(&["-i", "--refresh-interval"], Store,
             "number of TICKS to wait before reparsing /proc for cpu usage information. Performance sensitive. Defaults to 10.");
+        ap.refer(&mut opt.exclude_tty)
+            .add_option(&["-x", "--exclude-tty"], StoreTrue,
+            "Don't suspend processes controlling a [pt]ty.");
         ap.add_option(&["-V", "--version"],
             argparse::Print(env!("CARGO_PKG_VERSION").to_string()), "Show version and exit");
         ap.parse_args_or_exit();
