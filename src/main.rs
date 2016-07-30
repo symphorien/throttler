@@ -260,7 +260,7 @@ fn main() {
             
             // at this point, all the processes are SIGCONT'ed :
             if SHOULD_EXIT.load(Ordering::SeqCst) {
-                println!("Exit cleanly.");
+                if OPTS.verbose { println!("Exit cleanly."); }
                 break;
             }
         }
@@ -274,7 +274,7 @@ fn main() {
 
         // at this point, all the processes are SIGCONT'ed :
         if SHOULD_EXIT.load(Ordering::SeqCst) {
-            println!("Exit cleanly.");
+            if OPTS.verbose { println!("Exit cleanly."); }
             break;
         }
 
