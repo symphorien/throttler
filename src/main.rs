@@ -6,6 +6,7 @@ extern crate libc;
 extern crate nix;
 extern crate sysconf;
 extern crate argparse;
+extern crate lru_cache;
 #[macro_use]
 extern crate lazy_static;
 
@@ -18,6 +19,8 @@ use time::{Duration, PreciseTime};
 use glob::glob;
 use libc::{clock_t,pid_t,uid_t};
 use nix::sys::signal;
+use lru_cache::LruCache;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering, ATOMIC_BOOL_INIT};
 use argparse::{ArgumentParser, StoreTrue, Store};
 
@@ -39,30 +42,42 @@ fn get_temp() -> Result<f32, String> {
     Ok(sum/(n as f32))
 }
 
-fn filter_process(p : &procinfo::pid::Stat) -> bool {
-    if p.pid == *SELF_PID {
-        return false;
+
+fn cached_filter_process(pid : pid_t) -> std::io::Result<Option<procinfo::pid::Stat>> {
+    match FILTER_CACHE.try_lock() {
+        Ok(mut cache) => match cache.get_mut(&pid).map(|&mut b| b) { 
+            Some(res) => match res {
+                false => Ok(None),
+                true => procinfo::pid::stat(pid).map(Some)
+            },
+            None => cacheable_filter_process(pid).map(|res| {cache.insert(pid, res.is_some()); res})
+        },
+        Err(_) => cacheable_filter_process(pid)
     }
-    if p.priority < 20 { // nice <0 or realtime
-        return false;
+}
+
+fn cacheable_filter_process(pid: pid_t) -> std::io::Result<Option<procinfo::pid::Stat>> {
+    if pid == *SELF_PID {
+        return Ok(None);
     }
-    if p.pid == 1 {
-        return false;
+    if pid == 1 {
+        return Ok(None);
     }
+    let p = try!(procinfo::pid::stat(pid));
     if OPTS.exclude_tty && p.tty_nr != 0 && p.pid == p.tty_pgrp {
-        return false;
+        return Ok(None);
     }
     if *SELF_UID != 0 {
-        match procinfo::pid::status(p.pid) {
-            Ok(infos)=> {
-                if infos.uid_saved != *SELF_UID && infos.uid_real != *SELF_UID {
-                    return false;
-                }
-            },
-            Err(e) => println!("Unable to get status of {} ({}) : {:?}", p.command, p.pid, e)
+        let infos = try!(procinfo::pid::status(pid));
+        if infos.uid_saved != *SELF_UID && infos.uid_real != *SELF_UID {
+            return Ok(None);
         }
     }
-    true
+    Ok(Some(p))
+}
+
+fn filter_process(p : &procinfo::pid::Stat) -> bool {
+    p.nice >= 0
 }
 
 struct CPUTime {
@@ -74,16 +89,17 @@ struct CPUTime {
 
 type CPUTimes = HashMap<pid_t, CPUTime>;
 
-fn update_times(from: &mut CPUTimes, to: &mut CPUTimes) -> Result<(), String> {
+fn update_times(from: &mut CPUTimes, to: &mut CPUTimes) -> std::io::Result<()> {
     for pid in procure::process::pids(){
-        let infos = try!(procinfo::pid::stat(pid).map_err(|e| e.to_string()));
-        if filter_process(&infos) {
-            let newtime = infos.utime + infos.stime;
-            let newtimestamp = PreciseTime::now();
-            to.insert(pid, CPUTime {time: newtime, timestamp: newtimestamp, name: infos.command, share: match from.get(&pid) {
-                Some(time) => (newtime - time.time) as f32 /time.timestamp.to(newtimestamp).num_microseconds().unwrap() as f32 * 1000000. / (*CLK_TCK as f32),
-                None => 0.
-            }});
+        if let Some(infos) = try!(cached_filter_process(pid)) {
+            if filter_process(&infos) {
+                let newtime = infos.utime + infos.stime;
+                let newtimestamp = PreciseTime::now();
+                to.insert(pid, CPUTime {time: newtime, timestamp: newtimestamp, name: infos.command, share: match from.get(&pid) {
+                    Some(time) => (newtime - time.time) as f32 /time.timestamp.to(newtimestamp).num_microseconds().unwrap() as f32 * 1000000. / (*CLK_TCK as f32),
+                    None => 0.
+                }});
+            }
         }
     }
     from.clear();
@@ -166,6 +182,7 @@ lazy_static!{
     static ref SELF_UID : uid_t = nix::unistd::getuid();
     static ref CLK_TCK : u32 = sysconf::sysconf(sysconf::SysconfVariable::ScClkTck).expect("Unable to get sysconf(CLK_TK)") as u32;
     static ref OPTS : Options = parse_args();
+    static ref FILTER_CACHE : Mutex<LruCache<pid_t, bool>> = Mutex::new(LruCache::new(500));
 }
 static SHOULD_EXIT : AtomicBool = ATOMIC_BOOL_INIT;
 
