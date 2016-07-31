@@ -93,15 +93,15 @@ fn cacheable_filter_process(pid: pid_t) -> std::io::Result<Option<procinfo::pid:
     if pid == 1 {
         return Ok(None);
     }
-    let p = try!(procinfo::pid::stat(pid));
-    if OPTS.exclude_tty && p.tty_nr != 0 && p.pid == p.tty_pgrp {
-        return Ok(None);
-    }
     if *SELF_UID != 0 {
         let infos = try!(procinfo::pid::status(pid));
         if infos.uid_saved != *SELF_UID && infos.uid_real != *SELF_UID {
             return Ok(None);
         }
+    }
+    let p = try!(procinfo::pid::stat(pid));
+    if OPTS.exclude_tty && p.tty_nr != 0 && p.pid == p.tty_pgrp {
+        return Ok(None);
     }
     Ok(Some(p))
 }
