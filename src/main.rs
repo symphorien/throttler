@@ -11,7 +11,7 @@ extern crate lru_cache;
 extern crate lazy_static;
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::iter::FromIterator;
 use std::collections::{HashMap, HashSet};
@@ -24,6 +24,36 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering, ATOMIC_BOOL_INIT};
 use argparse::{ArgumentParser, StoreTrue, Store};
 
+
+macro_rules! println_stderr(
+    ($($arg:tt)*) => { {
+        writeln!(&mut ::std::io::stderr(), $($arg)*).expect("Failed to write to stderr");
+    } }
+);
+
+macro_rules! print_stderr(
+    ($($arg:tt)*) => { {
+        write!(&mut ::std::io::stderr(), $($arg)*).expect("Failed to write to stderr");
+    } }
+);
+
+macro_rules! try_or_warn(
+    ($res:expr, $($arg:tt)*) => { {
+        match $res {
+            Ok(v) => Some(v),
+            Err(e) => {
+                print_stderr!("{}: ", *ME);
+                println_stderr!($($arg)*, err=e);
+                None
+            }
+        }
+    } }
+);
+
+
+const TEMP_SOURCES : &'static str  = "/sys/class/thermal/thermal_*/temp";
+
+
 fn get_temp_from<P: AsRef<Path>>(file_path: P) -> Result<f32, String> {
     let mut file = try!(File::open(file_path).map_err(|e| e.to_string()));
     let mut contents = String::new();
@@ -35,7 +65,7 @@ fn get_temp_from<P: AsRef<Path>>(file_path: P) -> Result<f32, String> {
 fn get_temp() -> Result<f32, String> {
     let mut sum = 1.;
     let mut n = 0;
-    for path in try!(glob("/sys/class/thermal/thermal_*/temp").map_err(|e| e.to_string())).filter_map(|globresult| match globresult { Ok(path) => Some(path), Err(_) => None }) {
+    for path in try!(glob(TEMP_SOURCES).map_err(|e| e.to_string())).filter_map(|x| try_or_warn!(x, "Error while globbing {:?} : {err}", TEMP_SOURCES)) {
         sum += try!(get_temp_from(path));
         n+=1;
     }
@@ -89,9 +119,9 @@ struct CPUTime {
 
 type CPUTimes = HashMap<pid_t, CPUTime>;
 
-fn update_times(from: &mut CPUTimes, to: &mut CPUTimes) -> std::io::Result<()> {
+fn update_times(from: &mut CPUTimes, to: &mut CPUTimes) {
     for pid in procure::process::pids(){
-        if let Some(infos) = try!(cached_filter_process(pid)) {
+        if let Some(Some(infos)) = try_or_warn!(cached_filter_process(pid), "Unable to parse infos for pid {} : {err}", pid) {
             if filter_process(&infos) {
                 let newtime = infos.utime + infos.stime;
                 let newtimestamp = PreciseTime::now();
@@ -103,14 +133,11 @@ fn update_times(from: &mut CPUTimes, to: &mut CPUTimes) -> std::io::Result<()> {
         }
     }
     from.clear();
-    Ok(())
 }
 
 fn killall<'a, T: Iterator<Item=&'a pid_t> >(pids : T, signal : signal::SigNum) {
     for &pid in pids {
-        if let Err(e) = signal::kill(pid, signal) {
-            println!("Error killing {} with {} : {}", pid, signal, e);
-        }
+        try_or_warn!(signal::kill(pid, signal), "kill -{} {} failed : {err}", signal, pid);
     }
 }
 
@@ -183,6 +210,12 @@ lazy_static!{
     static ref CLK_TCK : u32 = sysconf::sysconf(sysconf::SysconfVariable::ScClkTck).expect("Unable to get sysconf(CLK_TK)") as u32;
     static ref OPTS : Options = parse_args();
     static ref FILTER_CACHE : Mutex<LruCache<pid_t, bool>> = Mutex::new(LruCache::new(500));
+    static ref ME : String = {
+        match std::env::args_os().next() {
+            Some(name) => name.to_string_lossy().into_owned(),
+            None => "throttler".to_owned()
+        }
+    };
 }
 static SHOULD_EXIT : AtomicBool = ATOMIC_BOOL_INIT;
 
@@ -212,9 +245,7 @@ fn main() {
     let mut targets = HashSet::new();
     let mut last_times_refresh = PreciseTime::now();
     let times_refresh_interval = Duration::milliseconds((OPTS.tick*(OPTS.interval as u16)) as i64);
-    if let Err(e) = update_times(&mut reserve, &mut procinfo) {
-        println!("{}", e);
-    }
+    update_times(&mut reserve, &mut procinfo);
 
     let tick = Duration::milliseconds(OPTS.tick as i64);
     let mut last_loop = PreciseTime::now();
@@ -239,9 +270,7 @@ fn main() {
 
             // processes
             std::mem::swap(&mut reserve, &mut procinfo);
-            if let Err(e) = update_times(&mut reserve, &mut procinfo) {
-                println!("{}", e);
-            }
+            update_times(&mut reserve, &mut procinfo);
             time_consumers.extend(procinfo.iter().filter_map(|(&pid, time)| if time.share > OPTS.min_cpu*OPTS.tolerance { Some((time.share, pid)) } else { None }));
             time_consumers.sort_by(|&(t, _), &(u, _)| u.partial_cmp(&t).unwrap());
 
