@@ -24,19 +24,39 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering, ATOMIC_BOOL_INIT};
 use argparse::{ArgumentParser, StoreTrue, Store};
 
-
+/// like print! but to stderr
 macro_rules! println_stderr(
     ($($arg:tt)*) => { {
         writeln!(&mut ::std::io::stderr(), $($arg)*).expect("Failed to write to stderr");
     } }
 );
 
+/// like println! but to stderr
 macro_rules! print_stderr(
     ($($arg:tt)*) => { {
         write!(&mut ::std::io::stderr(), $($arg)*).expect("Failed to write to stderr");
     } }
 );
 
+/// ```try_or_warn!(x: Result<R, E>, format_string, format_elements, ...) -> Option<R>)```
+/// This macro turns a ```Result``` ```x``` in an option like ```x.ok()``` but if ```x``` is an
+/// error, an error message will be printed to stderr :
+/// * the name (```ME```) of the program followed by a semicolon
+/// * println_stderr!(format_string, format_elements, ..., err=x.unwrap_err()) will print a custom
+/// error message
+/// # Example
+/// ```
+/// try_or_warn!(Ok(12), "Trying with {} something went bad : {err}", 12)
+/// 
+/// ```
+/// prints nothing and yields ```Some(12)``` while
+/// ```
+/// try_or_warn!(Err(42), "Trying with {} something went bad : {err}", 12)
+/// ```
+/// yields ```None``` and prints something like 
+/// ```
+/// throttler : Trying with 12 something went bad : 42```
+/// ```
 macro_rules! try_or_warn(
     ($res:expr, $($arg:tt)*) => { {
         match $res {
@@ -51,9 +71,11 @@ macro_rules! try_or_warn(
 );
 
 
+/// a glob pattern for the files where temperature is available
 const TEMP_SOURCES : &'static str  = "/sys/class/thermal/thermal_*/temp";
 
 
+/// Reads temperature from the given file.
 fn get_temp_from<P: AsRef<Path>>(file_path: P) -> Result<f32, String> {
     let mut file = try!(File::open(file_path).map_err(|e| e.to_string()));
     let mut contents = String::new();
@@ -62,6 +84,9 @@ fn get_temp_from<P: AsRef<Path>>(file_path: P) -> Result<f32, String> {
     Ok(n/1000.)
 }
 
+/// calls ```get_temp_from``` on all paths matching ```TEMP_SOURCES``` and yield their average
+///
+/// Error are displayed on stderr and then ignored
 fn get_temp() -> Result<f32, String> {
     let mut sum = 1.;
     let mut n = 0;
@@ -72,7 +97,12 @@ fn get_temp() -> Result<f32, String> {
     Ok(sum/(n as f32))
 }
 
-
+///  wraps ```cacheable_filter_process``` in a LRU cache.
+///
+///  Returns 
+///  * an error on error (lol)
+///  * Ok(None) if the process has been filtered out
+///  * Ok(Some(procinfo::pid::Stat {...})) if the process is interesting
 fn cached_filter_process(pid : pid_t) -> std::io::Result<Option<procinfo::pid::Stat>> {
     match FILTER_CACHE.try_lock() {
         Ok(mut cache) => match cache.get_mut(&pid).map(|&mut b| b) { 
@@ -86,6 +116,21 @@ fn cached_filter_process(pid : pid_t) -> std::io::Result<Option<procinfo::pid::S
     }
 }
 
+/// filters out all the process we can't/should'nt slow down
+///
+/// This function only perform tests we can reasonably think of immutable throughout the life of a
+/// process
+///
+/// Are filtered out
+/// * ourselves
+/// * ```init```
+/// * if we are not ```root```, processes from other users (see ```man 2 kill``` for subtleties)
+/// * processes owning a tty if ```OPTS.exclude_tty```
+/// 
+///  Returns 
+///  * an error on error (lol)
+///  * Ok(None) if the process has been filtered out
+///  * Ok(Some(procinfo::pid::Stat {...})) if the process is interesting
 fn cacheable_filter_process(pid: pid_t) -> std::io::Result<Option<procinfo::pid::Stat>> {
     if pid == *SELF_PID {
         return Ok(None);
@@ -106,19 +151,34 @@ fn cacheable_filter_process(pid: pid_t) -> std::io::Result<Option<procinfo::pid:
     Ok(Some(p))
 }
 
+
+/// all the tests which don't fit in ```cacheable_filter_process``` : those we should do every time
+///
+/// currently : ```nice < 0```
 fn filter_process(p : &procinfo::pid::Stat) -> bool {
     p.nice >= 0
 }
 
+/// information needed to compute how much cpu a process consumes
 struct CPUTime {
+    /// user + system time since boot
     time: clock_t,
+    /// timestamp when ```time``` was measured
     timestamp: PreciseTime,
+    /// cpu share computed as a result between 0 and 1
     share: f32,
+    /// the name of the process because it is handy
     name: String,
 }
 
+/// global store of cpu usage mesasures
 type CPUTimes = HashMap<pid_t, CPUTime>;
 
+/// Computes how much cpu time every current process took since last measures
+///
+/// takes two hashmaps :
+/// * ```from``` which contains previous measures and will be cleared
+/// * ```to``` which will store the new measures and is assumed to be initially empty
 fn update_times(from: &mut CPUTimes, to: &mut CPUTimes) {
     for pid in procure::process::pids(){
         if let Some(Some(infos)) = try_or_warn!(cached_filter_process(pid), "Unable to parse infos for pid {} : {err}", pid) {
@@ -135,17 +195,24 @@ fn update_times(from: &mut CPUTimes, to: &mut CPUTimes) {
     from.clear();
 }
 
+/// kills all the pid's with the given signal.
+///
+/// errors will be displayed on stderr and dismissed.
 fn killall<'a, T: Iterator<Item=&'a pid_t> >(pids : T, signal : signal::SigNum) {
     for &pid in pids {
         try_or_warn!(signal::kill(pid, signal), "kill -{} {} failed : {err}", signal, pid);
     }
 }
 
+/// our signal handler : simply set ```SHOULD_EXIT``` to ```true```.
 #[allow(unused_variables)]
 extern "C" fn set_should_exit(signal : signal::SigNum) {
     SHOULD_EXIT.store(true, Ordering::SeqCst);
 }
 
+/// where to store command line options.
+///
+/// for doc about the members, see ```parse_args```'s code.
 #[derive(Debug)]
 struct Options {
     min_cpu : f32,
@@ -158,6 +225,7 @@ struct Options {
     exclude_tty: bool,
 }
 
+/// return an ```Options``` accordint to given command line options
 fn parse_args() -> Options {
     let mut opt = Options {
         min_cpu : 0.01,
@@ -205,11 +273,17 @@ fn parse_args() -> Options {
 
 
 lazy_static!{
+    /// our pid
     static ref SELF_PID : pid_t = nix::unistd::getpid();
+    /// our uid
     static ref SELF_UID : uid_t = nix::unistd::getuid();
+    /// sysconf(SC_CLK_TCK)
     static ref CLK_TCK : u32 = sysconf::sysconf(sysconf::SysconfVariable::ScClkTck).expect("Unable to get sysconf(CLK_TK)") as u32;
+    /// command line options
     static ref OPTS : Options = parse_args();
+    /// cache of ```cached_filter_process```
     static ref FILTER_CACHE : Mutex<LruCache<pid_t, bool>> = Mutex::new(LruCache::new(500));
+    /// name of the current process : ```argv[0]```
     static ref ME : String = {
         match std::env::args_os().next() {
             Some(name) => name.to_string_lossy().into_owned(),
@@ -217,13 +291,18 @@ lazy_static!{
         }
     };
 }
+
+/// whether we should exit as soon as possible (but when all processes are ```SIGCONT```ed
 static SHOULD_EXIT : AtomicBool = ATOMIC_BOOL_INIT;
 
 fn main() {
+    // here we force the lazy static to be evaluated, and thus command line options to be parsed.
+    // it is needed in case of --help or --verbose : the process should exit now
     if OPTS.verbose {
         println!("Started with options : {:?}", *OPTS);
     }
 
+    // install the signal handler
     let sig_action = signal::SigAction::new(signal::SigHandler::Handler(set_should_exit), signal::SaFlags::empty(), signal::SigSet::all());
     
     unsafe {
@@ -237,12 +316,18 @@ fn main() {
         }
     }
 
+    // our two cpu usage hashmap
     let mut procinfo = HashMap::new();
     let mut reserve = HashMap::new();
+    // sum of all cpu usage of the processes in time_consumers
     let mut total_cpu : f32 = 0.;
+    // our target according to temp
     let mut max_cpu : f32 = 1.;
+    // processes matching the filter and with non negligible cpu_time
     let mut time_consumers : Vec<(f32, pid_t)> = vec![];
+    // those we will slow down
     let mut targets = HashSet::new();
+    // timestamp for procinfo refreshes
     let mut last_times_refresh = PreciseTime::now();
     let times_refresh_interval = Duration::milliseconds((OPTS.tick*(OPTS.interval as u16)) as i64);
     update_times(&mut reserve, &mut procinfo);
@@ -256,7 +341,7 @@ fn main() {
         }
         last_loop = PreciseTime::now();
 
-        // une fois par seconde, calculer les pids à relentir et la bride
+        // every second or so, recompute which processes are worth slowing down
         if last_times_refresh.to(PreciseTime::now()) > times_refresh_interval {
             last_times_refresh = PreciseTime::now();
 
@@ -311,7 +396,7 @@ fn main() {
             }
         }
 
-        // ralentir les pids sélectionnés
+        // slow down selected processes
         if targets.len() > 0 && max_cpu < 1. {
             killall(targets.iter(), signal::SIGSTOP);
             std::thread::sleep(std::time::Duration::new(0, ((tick.num_nanoseconds().unwrap() as f32)*(1.-max_cpu)) as u32));
