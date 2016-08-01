@@ -104,15 +104,15 @@ fn get_temp() -> Result<f32, String> {
 ///  * Ok(None) if the process has been filtered out
 ///  * Ok(Some(procinfo::pid::Stat {...})) if the process is interesting
 fn cached_filter_process(pid : pid_t) -> std::io::Result<Option<procinfo::pid::Stat>> {
-    match FILTER_CACHE.try_lock() {
-        Ok(mut cache) => match cache.get_mut(&pid).map(|&mut b| b) { 
+    match try_or_warn!(FILTER_CACHE.try_lock(), "Unable to lock cache : {err}") {
+        Some(mut cache) => match cache.get_mut(&pid).map(|&mut b| b) { 
             Some(res) => match res {
                 false => Ok(None),
                 true => procinfo::pid::stat(pid).map(Some)
             },
             None => cacheable_filter_process(pid).map(|res| {cache.insert(pid, res.is_some()); res})
         },
-        Err(_) => cacheable_filter_process(pid)
+        None => cacheable_filter_process(pid)
     }
 }
 
