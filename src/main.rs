@@ -11,38 +11,25 @@ extern crate lru_cache;
 extern crate lazy_static;
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
 use std::iter::FromIterator;
 use std::collections::{HashMap, HashSet};
 use time::{Duration, PreciseTime};
 use glob::glob;
-use libc::{clock_t,pid_t,uid_t};
+use libc::{clock_t,uid_t};
+use nix::unistd::Pid;
 use nix::sys::signal;
 use lru_cache::LruCache;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering, ATOMIC_BOOL_INIT};
 use argparse::{ArgumentParser, StoreTrue, Store};
 
-/// like print! but to stderr
-macro_rules! println_stderr(
-    ($($arg:tt)*) => { {
-        writeln!(&mut ::std::io::stderr(), $($arg)*).expect("Failed to write to stderr");
-    } }
-);
-
-/// like println! but to stderr
-macro_rules! print_stderr(
-    ($($arg:tt)*) => { {
-        write!(&mut ::std::io::stderr(), $($arg)*).expect("Failed to write to stderr");
-    } }
-);
-
 /// ```try_or_warn!(x: Result<R, E>, format_string, format_elements, ...) -> Option<R>)```
 /// This macro turns a ```Result``` ```x``` in an option like ```x.ok()``` but if ```x``` is an
 /// error, an error message will be printed to stderr :
 /// * the name (```ME```) of the program followed by a semicolon
-/// * println_stderr!(format_string, format_elements, ..., err=x.unwrap_err()) will print a custom
+/// * eprintln!(format_string, format_elements, ..., err=x.unwrap_err()) will print a custom
 /// error message
 /// # Example
 /// ```
@@ -62,8 +49,8 @@ macro_rules! try_or_warn(
         match $res {
             Ok(v) => Some(v),
             Err(e) => {
-                print_stderr!("{}: ", *ME);
-                println_stderr!($($arg)*, err=e);
+                eprint!("{}: ", *ME);
+                eprintln!($($arg)*, err=e);
                 None
             }
         }
@@ -103,12 +90,12 @@ fn get_temp() -> Result<f32, String> {
 ///  * an error on error (lol)
 ///  * Ok(None) if the process has been filtered out
 ///  * Ok(Some(procinfo::pid::Stat {...})) if the process is interesting
-fn cached_filter_process(pid : pid_t) -> std::io::Result<Option<procinfo::pid::Stat>> {
+fn cached_filter_process(pid : Pid) -> std::io::Result<Option<procinfo::pid::Stat>> {
     match try_or_warn!(FILTER_CACHE.try_lock(), "Unable to lock cache : {err}") {
         Some(mut cache) => match cache.get_mut(&pid).map(|&mut b| b) { 
             Some(res) => match res {
                 false => Ok(None),
-                true => procinfo::pid::stat(pid).map(Some)
+                true => procinfo::pid::stat(pid.into()).map(Some)
             },
             None => cacheable_filter_process(pid).map(|res| {cache.insert(pid, res.is_some()); res})
         },
@@ -131,20 +118,20 @@ fn cached_filter_process(pid : pid_t) -> std::io::Result<Option<procinfo::pid::S
 ///  * an error on error (lol)
 ///  * Ok(None) if the process has been filtered out
 ///  * Ok(Some(procinfo::pid::Stat {...})) if the process is interesting
-fn cacheable_filter_process(pid: pid_t) -> std::io::Result<Option<procinfo::pid::Stat>> {
+fn cacheable_filter_process(pid: Pid) -> std::io::Result<Option<procinfo::pid::Stat>> {
     if pid == *SELF_PID {
         return Ok(None);
     }
-    if pid == 1 {
+    if pid == Pid::from_raw(1) {
         return Ok(None);
     }
     if *SELF_UID != 0 {
-        let infos = try!(procinfo::pid::status(pid));
+        let infos = try!(procinfo::pid::status(pid.into()));
         if infos.uid_saved != *SELF_UID && infos.uid_real != *SELF_UID {
             return Ok(None);
         }
     }
-    let p = try!(procinfo::pid::stat(pid));
+    let p = try!(procinfo::pid::stat(pid.into()));
     if OPTS.exclude_tty && p.tty_nr != 0 && p.pid == p.tty_pgrp {
         return Ok(None);
     }
@@ -172,7 +159,7 @@ struct CPUTime {
 }
 
 /// global store of cpu usage mesasures
-type CPUTimes = HashMap<pid_t, CPUTime>;
+type CPUTimes = HashMap<Pid, CPUTime>;
 
 /// Computes how much cpu time every current process took since last measures
 ///
@@ -180,7 +167,7 @@ type CPUTimes = HashMap<pid_t, CPUTime>;
 /// * ```from``` which contains previous measures and will be cleared
 /// * ```to``` which will store the new measures and is assumed to be initially empty
 fn update_times(from: &mut CPUTimes, to: &mut CPUTimes) {
-    for pid in procure::process::pids(){
+    for pid in procure::process::pids().map(Pid::from_raw){
         if let Some(Some(infos)) = try_or_warn!(cached_filter_process(pid), "Unable to parse infos for pid {} : {err}", pid) {
             if filter_process(&infos) {
                 let newtime = infos.utime + infos.stime;
@@ -198,15 +185,15 @@ fn update_times(from: &mut CPUTimes, to: &mut CPUTimes) {
 /// kills all the pid's with the given signal.
 ///
 /// errors will be displayed on stderr and dismissed.
-fn killall<'a, T: Iterator<Item=&'a pid_t> >(pids : T, signal : signal::SigNum) {
+fn killall<'a, T: Iterator<Item=&'a Pid> >(pids : T, signal : signal::Signal) {
     for &pid in pids {
-        try_or_warn!(signal::kill(pid, signal), "kill -{} {} failed : {err}", signal, pid);
+        try_or_warn!(signal::kill(pid, signal), "kill -{:?} {} failed : {err}", signal, pid);
     }
 }
 
 /// our signal handler : simply set ```SHOULD_EXIT``` to ```true```.
 #[allow(unused_variables)]
-extern "C" fn set_should_exit(signal : signal::SigNum) {
+extern "C" fn set_should_exit(signal : libc::c_int) {
     SHOULD_EXIT.store(true, Ordering::SeqCst);
 }
 
@@ -274,15 +261,15 @@ fn parse_args() -> Options {
 
 lazy_static!{
     /// our pid
-    static ref SELF_PID : pid_t = nix::unistd::getpid();
+    static ref SELF_PID : Pid = nix::unistd::getpid();
     /// our uid
-    static ref SELF_UID : uid_t = nix::unistd::getuid();
+    static ref SELF_UID : uid_t = nix::unistd::getuid().into();
     /// sysconf(SC_CLK_TCK)
     static ref CLK_TCK : u32 = sysconf::sysconf(sysconf::SysconfVariable::ScClkTck).expect("Unable to get sysconf(CLK_TK)") as u32;
     /// command line options
     static ref OPTS : Options = parse_args();
     /// cache of ```cached_filter_process```
-    static ref FILTER_CACHE : Mutex<LruCache<pid_t, bool>> = Mutex::new(LruCache::new(500));
+    static ref FILTER_CACHE : Mutex<LruCache<Pid, bool>> = Mutex::new(LruCache::new(500));
     /// name of the current process : ```argv[0]```
     static ref ME : String = {
         match std::env::args_os().next() {
@@ -320,11 +307,11 @@ fn main() {
     let mut procinfo = HashMap::new();
     let mut reserve = HashMap::new();
     // sum of all cpu usage of the processes in time_consumers
-    let mut total_cpu : f32 = 0.;
+    let mut total_cpu : f32;
     // our target according to temp
     let mut max_cpu : f32 = 1.;
     // processes matching the filter and with non negligible cpu_time
-    let mut time_consumers : Vec<(f32, pid_t)> = vec![];
+    let mut time_consumers : Vec<(f32, Pid)> = vec![];
     // those we will slow down
     let mut targets = HashSet::new();
     // timestamp for procinfo refreshes

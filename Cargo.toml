@@ -1,16 +1,16 @@
 [package]
 name = "throttler"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Symphorien Gibol <symphorien@xlumurb.eu>"]
 
 [dependencies]
-procure = "*"
-procinfo = "*"
-glob = "*"
-time = "*"
-libc = "*"
-nix = "*"
-sysconf = "*"
-lazy_static = "*"
-argparse = "*"
-lru-cache = "*"
+procure = "0.1"
+procinfo = "0.4"
+glob = "0.2"
+time = "0.1"
+libc = "0.2"
+nix = "0.11"
+sysconf = "0.3"
+lazy_static = "1.0"
+argparse = "0.2"
+lru-cache = "0.1"
