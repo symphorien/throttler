@@ -1,15 +1,14 @@
 [package]
 name = "throttler"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Symphorien Gibol <symphorien@xlumurb.eu>"]
 
 [dependencies]
-procure = "0.1"
-procinfo = "0.4"
+procfs = "0.8"
 glob = "0.2"
 time = "0.1"
 libc = "0.2"
-nix = "0.11"
+nix = "0.17"
 sysconf = "0.3"
 lazy_static = "1.0"
 argparse = "0.2"

@@ -1,6 +1,7 @@
-extern crate procure;
+#[allow(deprecated)]
+
 extern crate glob;
-extern crate procinfo;
+extern crate procfs;
 extern crate time;
 extern crate libc;
 extern crate nix;
@@ -18,12 +19,14 @@ use std::collections::{HashMap, HashSet};
 use time::{Duration, PreciseTime};
 use glob::glob;
 use libc::{clock_t,uid_t};
-use nix::unistd::Pid;
 use nix::sys::signal;
 use lru_cache::LruCache;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering, ATOMIC_BOOL_INIT};
 use argparse::{ArgumentParser, StoreTrue, Store};
+use procfs::process::Process;
+
+type Pid = i32;
 
 /// ```try_or_warn!(x: Result<R, E>, format_string, format_elements, ...) -> Option<R>)```
 /// This macro turns a ```Result``` ```x``` in an option like ```x.ok()``` but if ```x``` is an
@@ -84,72 +87,48 @@ fn get_temp() -> Result<f32, String> {
     Ok(sum/(n as f32))
 }
 
-///  wraps ```cacheable_filter_process``` in a LRU cache.
-///
-///  Returns 
-///  * an error on error (lol)
-///  * Ok(None) if the process has been filtered out
-///  * Ok(Some(procinfo::pid::Stat {...})) if the process is interesting
-fn cached_filter_process(pid : Pid) -> std::io::Result<Option<procinfo::pid::Stat>> {
-    match try_or_warn!(FILTER_CACHE.try_lock(), "Unable to lock cache : {err}") {
-        Some(mut cache) => match cache.get_mut(&pid).map(|&mut b| b) { 
-            Some(res) => match res {
-                false => Ok(None),
-                true => procinfo::pid::stat(pid.into()).map(Some)
-            },
-            None => cacheable_filter_process(pid).map(|res| {cache.insert(pid, res.is_some()); res})
-        },
-        None => cacheable_filter_process(pid)
-    }
-}
 
 /// filters out all the process we can't/should'nt slow down
-///
-/// This function only perform tests we can reasonably think of immutable throughout the life of a
-/// process
 ///
 /// Are filtered out
 /// * ourselves
 /// * ```init```
 /// * if we are not ```root```, processes from other users (see ```man 2 kill``` for subtleties)
 /// * processes owning a tty if ```OPTS.exclude_tty```
+/// * processes with negative niceness
 /// 
-///  Returns 
-///  * an error on error (lol)
-///  * Ok(None) if the process has been filtered out
-///  * Ok(Some(procinfo::pid::Stat {...})) if the process is interesting
-fn cacheable_filter_process(pid: Pid) -> std::io::Result<Option<procinfo::pid::Stat>> {
-    if pid == *SELF_PID {
-        return Ok(None);
+///  Returns true if the process can be slowed down
+fn filter_process(process: &Process) -> bool {
+    if process.pid == *SELF_PID {
+        return false;
     }
-    if pid == Pid::from_raw(1) {
-        return Ok(None);
+    if process.pid == 1 {
+        return false;
+    }
+    if OPTS.exclude_tty && process.stat.tty_nr != 0 && process.stat.pid == process.stat.tpgid {
+        return false;
+    }
+    if process.stat.nice < 0 {
+        return false
     }
     if *SELF_UID != 0 {
-        let infos = try!(procinfo::pid::status(pid.into()));
-        if infos.uid_saved != *SELF_UID && infos.uid_real != *SELF_UID {
-            return Ok(None);
+        match process.status() {
+            Err(_) => return false,
+            Ok(infos) => {
+                if infos.suid != *SELF_UID && infos.ruid != *SELF_UID {
+                    return false;
+                }
+            }
         }
     }
-    let p = try!(procinfo::pid::stat(pid.into()));
-    if OPTS.exclude_tty && p.tty_nr != 0 && p.pid == p.tty_pgrp {
-        return Ok(None);
-    }
-    Ok(Some(p))
+    return true
 }
 
-
-/// all the tests which don't fit in ```cacheable_filter_process``` : those we should do every time
-///
-/// currently : ```nice < 0```
-fn filter_process(p : &procinfo::pid::Stat) -> bool {
-    p.nice >= 0
-}
 
 /// information needed to compute how much cpu a process consumes
 struct CPUTime {
     /// user + system time since boot
-    time: clock_t,
+    time: u64,
     /// timestamp when ```time``` was measured
     timestamp: PreciseTime,
     /// cpu share computed as a result between 0 and 1
@@ -167,16 +146,18 @@ type CPUTimes = HashMap<Pid, CPUTime>;
 /// * ```from``` which contains previous measures and will be cleared
 /// * ```to``` which will store the new measures and is assumed to be initially empty
 fn update_times(from: &mut CPUTimes, to: &mut CPUTimes) {
-    for pid in procure::process::pids().map(Pid::from_raw){
-        if let Some(Some(infos)) = try_or_warn!(cached_filter_process(pid), "Unable to parse infos for pid {} : {err}", pid) {
-            if filter_process(&infos) {
-                let newtime = infos.utime + infos.stime;
+    let process_list = match try_or_warn!(procfs::process::all_processes(), "Unable to list processes: {err}") {
+        None => return,
+        Some(x) => x
+    };
+    for process in process_list.into_iter() {
+        if filter_process(&process) {
+                let newtime = (process.stat.utime + process.stat.stime) as u64;
                 let newtimestamp = PreciseTime::now();
-                to.insert(pid, CPUTime {time: newtime, timestamp: newtimestamp, name: infos.command, share: match from.get(&pid) {
+                to.insert(process.pid, CPUTime {time: newtime, timestamp: newtimestamp, name: process.stat.comm, share: match from.get(&process.pid) {
                     Some(time) => (newtime - time.time) as f32 /time.timestamp.to(newtimestamp).num_microseconds().unwrap() as f32 * 1000000. / (*CLK_TCK as f32),
                     None => 0.
                 }});
-            }
         }
     }
     from.clear();
@@ -185,9 +166,9 @@ fn update_times(from: &mut CPUTimes, to: &mut CPUTimes) {
 /// kills all the pid's with the given signal.
 ///
 /// errors will be displayed on stderr and dismissed.
-fn killall<'a, T: Iterator<Item=&'a Pid> >(pids : T, signal : signal::Signal) {
-    for &pid in pids {
-        try_or_warn!(signal::kill(pid, signal), "kill -{:?} {} failed : {err}", signal, pid);
+fn killall<T: Iterator<Item=Pid> >(pids : T, signal : signal::Signal) {
+    for pid in pids {
+        try_or_warn!(signal::kill(nix::unistd::Pid::from_raw(pid), signal), "kill -{:?} {} failed : {err}", signal, pid);
     }
 }
 
@@ -261,9 +242,9 @@ fn parse_args() -> Options {
 
 lazy_static!{
     /// our pid
-    static ref SELF_PID : Pid = nix::unistd::getpid();
+    static ref SELF_PID : Pid = nix::unistd::getpid().as_raw();
     /// our uid
-    static ref SELF_UID : uid_t = nix::unistd::getuid().into();
+    static ref SELF_UID : uid_t = nix::unistd::getuid().as_raw();
     /// sysconf(SC_CLK_TCK)
     static ref CLK_TCK : u32 = sysconf::sysconf(sysconf::SysconfVariable::ScClkTck).expect("Unable to get sysconf(CLK_TK)") as u32;
     /// command line options
@@ -385,9 +366,9 @@ fn main() {
 
         // slow down selected processes
         if targets.len() > 0 && max_cpu < 1. {
-            killall(targets.iter(), signal::SIGSTOP);
+            killall(targets.iter().cloned(), signal::SIGSTOP);
             std::thread::sleep(std::time::Duration::new(0, ((tick.num_nanoseconds().unwrap() as f32)*(1.-max_cpu)) as u32));
-            killall(targets.iter(), signal::SIGCONT);
+            killall(targets.iter().cloned(), signal::SIGCONT);
         }
 
         // at this point, all the processes are SIGCONT'ed :
