@@ -281,13 +281,18 @@ fn main() {
         }
     }
 
+    let num_cpu = try_or_warn!(procfs::CpuInfo::new(), "Could not determine the number of cores: {err}").map(|i| i.num_cores()).unwrap_or(1);
+
+    // all calculations are done in aggregated cpu time, from 0 to num_cpu, but options are from 0 to 1
+    // minimum cpu usage
+    let min_cpu = OPTS.min_cpu * (num_cpu as f32);
     // our two cpu usage hashmap
     let mut procinfo = HashMap::new();
     let mut reserve = HashMap::new();
     // sum of all cpu usage of the processes in time_consumers
     let mut total_cpu : f32;
-    // our target according to temp
-    let mut max_cpu : f32 = 1.;
+    // fraction of cpu time that can be used, less than the number of cpus means slowdown
+    let mut max_cpu : f32 = num_cpu as _;
     // processes matching the filter and with non negligible cpu_time
     let mut time_consumers : Vec<(f32, Pid)> = vec![];
     // those we will slow down
@@ -316,26 +321,29 @@ fn main() {
                 if OPTS.verbose {
                     println!("{} °C", temp);
                 }
-                max_cpu = OPTS.min_cpu + (1. - OPTS.min_cpu)*1f32.min(0f32.max((OPTS.max_temp - temp)/(OPTS.max_temp - OPTS.min_temp)));
+                max_cpu = min_cpu + ((num_cpu as f32) - min_cpu)*(1f32.min(0f32.max((OPTS.max_temp - temp)/(OPTS.max_temp - OPTS.min_temp))));
             }
 
             // processes
             std::mem::swap(&mut reserve, &mut procinfo);
             update_times(&mut reserve, &mut procinfo);
-            time_consumers.extend(procinfo.iter().filter_map(|(&pid, time)| if time.share > OPTS.min_cpu*OPTS.tolerance { Some((time.share, pid)) } else { None }));
+            time_consumers.extend(procinfo.iter().filter_map(|(&pid, time)| if time.share > min_cpu*OPTS.tolerance { Some((time.share, pid)) } else { None }));
             time_consumers.sort_by(|&(t, _), &(u, _)| u.partial_cmp(&t).unwrap());
 
             total_cpu = time_consumers.iter().fold(0., |acc, &(t, _)| acc+t);
 
             if OPTS.verbose {
-                println!("CPU : {} %\tmax : {} %", (total_cpu*100.) as u8, (max_cpu*100.) as u8);
-                for &(t, pid) in &time_consumers {
-                    println!("\t{}\t{} %\t{}", pid, (t*100.) as u8, procinfo.get(&pid).unwrap().name);
+                println!("CPU : {:0.2} %\tmax : {:0.2} %", total_cpu*100., max_cpu*100.);
+                if !time_consumers.is_empty() {
+                    println!("{} processes are potential targets: ", time_consumers.len());
+                    for &(t, pid) in &time_consumers {
+                        println!("\t{}\t{:0.2} %\t{}", pid, t*100., procinfo.get(&pid).unwrap().name);
+                    }
                 }
             }
 
 
-            if max_cpu < 1. && total_cpu * OPTS.tolerance > max_cpu {
+            if max_cpu < (num_cpu as f32) && total_cpu * OPTS.tolerance > max_cpu {
                 let mut partial_sum = 0.;
                 for &(t, pid) in &time_consumers {
                     partial_sum += t;
@@ -348,7 +356,7 @@ fn main() {
             
             targets = &targets & &HashSet::from_iter(&mut time_consumers.drain(..).map(|(_, pid)| pid));
 
-            if max_cpu < 1. && OPTS.verbose {
+            if max_cpu < (num_cpu as f32) && OPTS.verbose {
                 println!("Enforcing threshold on");
                 for pid in targets.iter() {
                     println!("\t{}\t{}", pid, procinfo.get(&pid).unwrap().name);
@@ -363,9 +371,9 @@ fn main() {
         }
 
         // slow down selected processes
-        if targets.len() > 0 && max_cpu < 1. {
+        if targets.len() > 0 && max_cpu < (num_cpu as f32) {
             killall(targets.iter().cloned(), signal::SIGSTOP);
-            std::thread::sleep(std::time::Duration::from_nanos(((tick.as_nanos() as f32)*(1.-max_cpu)) as _));
+            std::thread::sleep(std::time::Duration::from_nanos(((tick.as_nanos() as f32)*(num_cpu as f32 - max_cpu)/(num_cpu as f32)) as _));
             killall(targets.iter().cloned(), signal::SIGCONT);
         }
 
