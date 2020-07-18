@@ -1,5 +1,3 @@
-#[allow(deprecated)]
-
 extern crate glob;
 extern crate procfs;
 extern crate time;
@@ -18,11 +16,11 @@ use std::iter::FromIterator;
 use std::collections::{HashMap, HashSet};
 use time::{Duration, PreciseTime};
 use glob::glob;
-use libc::{clock_t,uid_t};
+use libc::uid_t;
 use nix::sys::signal;
 use lru_cache::LruCache;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering, ATOMIC_BOOL_INIT};
+use std::sync::atomic::{AtomicBool, Ordering};
 use argparse::{ArgumentParser, StoreTrue, Store};
 use procfs::process::Process;
 
@@ -67,10 +65,10 @@ const TEMP_SOURCES : &'static str  = "/sys/class/thermal/thermal_*/temp";
 
 /// Reads temperature from the given file.
 fn get_temp_from<P: AsRef<Path>>(file_path: P) -> Result<f32, String> {
-    let mut file = try!(File::open(file_path).map_err(|e| e.to_string()));
+    let mut file = File::open(file_path).map_err(|e| e.to_string())?;
     let mut contents = String::new();
-    try!(file.read_to_string(&mut contents).map_err(|e| e.to_string()));
-    let n = try!(contents.trim().parse::<f32>().map_err(|e| e.to_string()));
+    file.read_to_string(&mut contents).map_err(|e| e.to_string())?;
+    let n = contents.trim().parse::<f32>().map_err(|e| e.to_string())?;
     Ok(n/1000.)
 }
 
@@ -80,8 +78,8 @@ fn get_temp_from<P: AsRef<Path>>(file_path: P) -> Result<f32, String> {
 fn get_temp() -> Result<f32, String> {
     let mut sum = 1.;
     let mut n = 0;
-    for path in try!(glob(TEMP_SOURCES).map_err(|e| e.to_string())).filter_map(|x| try_or_warn!(x, "Error while globbing {:?} : {err}", TEMP_SOURCES)) {
-        sum += try!(get_temp_from(path));
+    for path in glob(TEMP_SOURCES).map_err(|e| e.to_string())?.filter_map(|x| try_or_warn!(x, "Error while globbing {:?} : {err}", TEMP_SOURCES)) {
+        sum += get_temp_from(path)?;
         n+=1;
     }
     Ok(sum/(n as f32))
@@ -261,7 +259,7 @@ lazy_static!{
 }
 
 /// whether we should exit as soon as possible (but when all processes are ```SIGCONT```ed
-static SHOULD_EXIT : AtomicBool = ATOMIC_BOOL_INIT;
+static SHOULD_EXIT : AtomicBool = AtomicBool::new(false);
 
 fn main() {
     // here we force the lazy static to be evaluated, and thus command line options to be parsed.
