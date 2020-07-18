@@ -6,7 +6,6 @@ authors = ["Symphorien Gibol <symphorien@xlumurb.eu>"]
 [dependencies]
 procfs = "0.8"
 glob = "0.3"
-time = "0.1"
 libc = "0.2"
 nix = "0.17"
 sysconf = "0.3"

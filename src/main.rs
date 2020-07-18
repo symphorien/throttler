@@ -1,6 +1,5 @@
 extern crate glob;
 extern crate procfs;
-extern crate time;
 extern crate libc;
 extern crate nix;
 extern crate sysconf;
@@ -14,7 +13,7 @@ use std::io::Read;
 use std::path::Path;
 use std::iter::FromIterator;
 use std::collections::{HashMap, HashSet};
-use time::{Duration, PreciseTime};
+use std::time::{Duration, Instant};
 use glob::glob;
 use libc::uid_t;
 use nix::sys::signal;
@@ -128,7 +127,7 @@ struct CPUTime {
     /// user + system time since boot
     time: u64,
     /// timestamp when ```time``` was measured
-    timestamp: PreciseTime,
+    timestamp: Instant,
     /// cpu share computed as a result between 0 and 1
     share: f32,
     /// the name of the process because it is handy
@@ -151,9 +150,9 @@ fn update_times(from: &mut CPUTimes, to: &mut CPUTimes) {
     for process in process_list.into_iter() {
         if filter_process(&process) {
                 let newtime = (process.stat.utime + process.stat.stime) as u64;
-                let newtimestamp = PreciseTime::now();
+                let newtimestamp = Instant::now();
                 to.insert(process.pid, CPUTime {time: newtime, timestamp: newtimestamp, name: process.stat.comm, share: match from.get(&process.pid) {
-                    Some(time) => (newtime - time.time) as f32 /time.timestamp.to(newtimestamp).num_microseconds().unwrap() as f32 * 1000000. / (*CLK_TCK as f32),
+                    Some(time) => (newtime - time.time) as f32 /newtimestamp.duration_since(time.timestamp).as_micros() as f32 * 1000000. / (*CLK_TCK as f32),
                     None => 0.
                 }});
         }
@@ -294,22 +293,23 @@ fn main() {
     // those we will slow down
     let mut targets = HashSet::new();
     // timestamp for procinfo refreshes
-    let mut last_times_refresh = PreciseTime::now();
-    let times_refresh_interval = Duration::milliseconds((OPTS.tick*(OPTS.interval as u16)) as i64);
+    let mut last_times_refresh = Instant::now();
+    let times_refresh_interval = Duration::from_millis((OPTS.tick*(OPTS.interval as u16)) as _);
     update_times(&mut reserve, &mut procinfo);
 
-    let tick = Duration::milliseconds(OPTS.tick as i64);
-    let mut last_loop = PreciseTime::now();
+    let tick = Duration::from_millis(OPTS.tick as _);
+    let mut last_loop = Instant::now();
 
     loop {
-        if let Ok(duration) = (tick - last_loop.to(PreciseTime::now())).to_std() {
+        let elapsed = Instant::now().duration_since(last_loop);
+        if let Some(duration) = tick.checked_sub(elapsed) {
             std::thread::sleep(duration);
         }
-        last_loop = PreciseTime::now();
+        last_loop = Instant::now();
 
         // every second or so, recompute which processes are worth slowing down
-        if last_times_refresh.to(PreciseTime::now()) > times_refresh_interval {
-            last_times_refresh = PreciseTime::now();
+        if last_loop.duration_since(last_times_refresh) > times_refresh_interval {
+            last_times_refresh = last_loop;
 
             // temperature
             if let Ok(temp) = get_temp() {
@@ -330,7 +330,7 @@ fn main() {
             if OPTS.verbose {
                 println!("CPU : {} %\tmax : {} %", (total_cpu*100.) as u8, (max_cpu*100.) as u8);
                 for &(t, pid) in &time_consumers {
-                    println!("\t{}\t{}\t{}", pid, (t*100.) as u8, procinfo.get(&pid).unwrap().name);
+                    println!("\t{}\t{} %\t{}", pid, (t*100.) as u8, procinfo.get(&pid).unwrap().name);
                 }
             }
 
@@ -365,7 +365,7 @@ fn main() {
         // slow down selected processes
         if targets.len() > 0 && max_cpu < 1. {
             killall(targets.iter().cloned(), signal::SIGSTOP);
-            std::thread::sleep(std::time::Duration::new(0, ((tick.num_nanoseconds().unwrap() as f32)*(1.-max_cpu)) as u32));
+            std::thread::sleep(std::time::Duration::from_nanos(((tick.as_nanos() as f32)*(1.-max_cpu)) as _));
             killall(targets.iter().cloned(), signal::SIGCONT);
         }
 
