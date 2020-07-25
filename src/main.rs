@@ -4,7 +4,6 @@ extern crate libc;
 extern crate nix;
 extern crate sysconf;
 extern crate argparse;
-extern crate lru_cache;
 #[macro_use]
 extern crate lazy_static;
 
@@ -17,8 +16,6 @@ use std::time::{Duration, Instant};
 use glob::glob;
 use libc::uid_t;
 use nix::sys::signal;
-use lru_cache::LruCache;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use argparse::{ArgumentParser, StoreTrue, Store};
 use procfs::process::Process;
@@ -246,8 +243,6 @@ lazy_static!{
     static ref CLK_TCK : u32 = sysconf::sysconf(sysconf::SysconfVariable::ScClkTck).expect("Unable to get sysconf(CLK_TK)") as u32;
     /// command line options
     static ref OPTS : Options = parse_args();
-    /// cache of ```cached_filter_process```
-    static ref FILTER_CACHE : Mutex<LruCache<Pid, bool>> = Mutex::new(LruCache::new(500));
     /// name of the current process : ```argv[0]```
     static ref ME : String = {
         match std::env::args_os().next() {
